@@ -528,6 +528,19 @@ impl ScalarFunc {
     ) -> Result<Option<Cow<'a, [u8]>>> {
         Ok(None)
     }
+
+    #[inline]
+    pub fn from_days<'a>(
+        &self,
+        ctx: &mut EvalContext,
+        row: &[Datum],
+    ) -> Result<Option<Cow<'a, Time>>> {
+        let days = try_opt!(self.children[0].eval_int(ctx, row)) as i32;
+        let (year, month, day) = get_date_from_daynr(days);
+        let date_str: String = format!("{:04}-{:02}-{:02}", year, month, day);
+        let time = Time::parse_date(ctx, date_str.as_str())?;
+        Ok(Some(Cow::Owned(time)))
+    }
 }
 
 #[inline]
@@ -558,6 +571,60 @@ fn month_to_period(month: u64) -> u64 {
     } else {
         year * 100 + month % 12 + 1
     }
+}
+
+// Changes a daynr to year, month and day, daynr 0 is returned as date 00.00.00
+#[inline]
+fn get_date_from_daynr(daynr: i32) -> (i32, i32, i32) {
+    if daynr <= 365 || daynr >= 3_652_500 {
+        return (0, 0, 0);
+    }
+
+    let mut year = daynr * 100 / 36525;
+    let temp = (((year - 1) / 100 + 1) * 3) / 4;
+    let mut day_of_year = daynr - year * 365 - (year - 1) / 4 + temp;
+
+    let mut days_in_year = calc_days_in_year(year);
+    while day_of_year > days_in_year {
+        day_of_year -= days_in_year;
+        year += 1;
+        days_in_year = calc_days_in_year(year);
+    }
+
+    let mut leap_day = 0;
+    if days_in_year == 366 {
+        if day_of_year > 31 + 28 {
+            day_of_year -= 1;
+            if day_of_year == 31 + 28 {
+                // Handle leapyears leapday.
+                leap_day = 1;
+            }
+        }
+    }
+
+    let days_in_month: Vec<i32> = vec![31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+    let mut month = 1;
+    for days in days_in_month {
+        if day_of_year <= days {
+            break;
+        }
+        day_of_year -= days;
+        month += 1;
+    }
+
+    let day = day_of_year + leap_day;
+
+    (year, month, day)
+}
+
+// Calculates days in one year, it works with 0 <= year <= 99.
+#[inline]
+fn calc_days_in_year(year: i32) -> i32 {
+    if (year & 3) == 0 && (year % 100 != 0 || (year % 400 == 0 && (year != 0))) {
+        return 366;
+    }
+    365
 }
 
 #[cfg(test)]
@@ -1739,5 +1806,36 @@ mod tests {
     fn test_add_sub_time_string_null() {
         let mut ctx = EvalContext::default();
         test_ok_case_zero_arg(&mut ctx, ScalarFuncSig::AddTimeStringNull, Datum::Null);
+    }
+
+    #[test]
+    fn test_from_days() {
+        let cases = vec![
+            (-140, "0000-00-00"),   // mysql FROM_DAYS returns 0000-00-00 for any day <= 365.
+            (140, "0000-00-00"),    // mysql FROM_DAYS returns 0000-00-00 for any day <= 365.
+            (735000, "2012-05-12"), // Leap year.
+            (735030, "2012-06-11"),
+            (735130, "2012-09-19"),
+            (734909, "2012-02-11"),
+            (734878, "2012-01-11"),
+            (734927, "2012-02-29"),
+            (734634, "2011-05-12"), // Non Leap year.
+            (734664, "2011-06-11"),
+            (734764, "2011-09-19"),
+            (734544, "2011-02-11"),
+            (734513, "2011-01-11"),
+        ];
+        let mut ctx = EvalContext::default();
+        for (arg, exp) in cases {
+            let datetime = Time::parse_date(&mut ctx, exp).unwrap();
+            test_ok_case_one_arg(
+                &mut ctx,
+                ScalarFuncSig::FromDays,
+                Datum::I64(arg),
+                Datum::Time(datetime),
+            );
+        }
+        // test NULL case
+        test_err_case_one_arg(&mut ctx, ScalarFuncSig::Month, Datum::Null);
     }
 }
